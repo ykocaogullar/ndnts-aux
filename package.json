@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@ndn/sync-api": "https://ndnts-nightly.ndn.today/sync-api.tgz",
+    "@ucla-irl/ndnts-aux": "^3.0.5",
     "cbor-x": "^1.6.0",
     "event-iterator": "^2.0.0",
     "eventemitter3": "^5.0.1",

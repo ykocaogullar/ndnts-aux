@@ -1,238 +1,290 @@
-import { Decoder, Encoder } from '@ndn/tlv';
-import { Component, Data, Interest, Name, Signer, LLSign, ValidityPeriod, Verifier } from '@ndn/packet';
-import { Certificate, createSigner, createVerifier, ECDSA } from '@ndn/keychain';
-import * as endpoint from '@ndn/endpoint';
-import type { Forwarder } from '@ndn/fw';
+import { CertStorage } from './cert-storage.ts';
+import { Certificate, createSigner, ECDSA, ValidityPeriod } from '@ndn/keychain';
+import { Name } from '@ndn/packet';
 import { Version } from '@ndn/naming-convention2';
-import { Storage } from '../storage/mod.ts';
-import { SecurityAgent } from './types.ts';
+import { NamedSigner } from '@ndn/keychain';
 
-
-// Define the invitation data
-interface InvitationData {
-  workspaceCert: Certificate;  // Workspace certificate
-  inviteeCert: Certificate;    // Invitee's certificate
-  //groupEncryptionKey: Uint8Array;  // Todo
-  trustPolicies: string;  // Policies governing trust within the workspace
-  signature: Uint8Array;      // Digital signature of the inviter (K3)
+export interface InvitationData {
+  workspaceCert: Certificate;
+  inviteeCert: Certificate;
+  // groupEncryptionKey: Uint8Array;  // Todo
+  // trustPolicies: string; // Policies governing trust within the workspace
+  // signature: Uint8Array; // Digital signature of the inviter (K3)
 }
 
-/**
- * A Signer & Verifier handling cross-zone trust relation.
- */
-// TODO: (Urgent) Add test to this class
-export class InvitationPackage implements SecurityAgent {
-  private _signer: Signer | undefined;
-  readonly readyEvent: Promise<void>;
-  // private trustedNames: string[] = [];  // TODO: Not used for now.
+export class InvitationPackage {
+  private certStorage?: CertStorage;
+  private personal_publicKey?: CryptoKey;
+  private personal_privateKey?: CryptoKey;
+  private signer?: NamedSigner;
+  private email?: Name;
+  readyEvent: Promise<void>;
 
-  constructor(
-    readonly trustAnchor: Certificate,
-    readonly ownCertificate: Certificate,
-    readonly storage: Storage,
-    readonly fw: Forwarder,
-    prvKeyBits: Uint8Array,
-  ) {
+  constructor() {
+    // Initialize readyEvent with a resolved Promise
+    this.readyEvent = Promise.resolve();
+  }
+
+  /** Initialize certStorage with a separate method */
+  initializeCertStorage(certStorage: CertStorage) {
+    this.certStorage = certStorage;
     this.readyEvent = (async () => {
-      await this.importCert(trustAnchor);
-      await this.importCert(ownCertificate);
-      const keyPair = await ECDSA.cryptoGenerate({
-        importPkcs8: [prvKeyBits, ownCertificate.publicKeySpki],
-      }, true);
-      this._signer = createSigner(
-        ownCertificate.name.getPrefix(ownCertificate.name.length - 2),
-        ECDSA,
-        keyPair,
-      ).withKeyLocator(ownCertificate.name);
+      await this.certStorage!.readyEvent;
     })();
   }
 
-  /** Obtain the signer */
-  get signer() {
-    return this._signer!;
+  /** Get CertStorage's signer if initialized, else use custom signer */
+  get signerInstance() {
+    if (this.certStorage) {
+      return this.certStorage.signer;
+    }
+    if (!this.signer) {
+      throw new Error('Signer is not initialized.');
+    }
+    return this.signer;
   }
 
-  /** Obtain this node's own certificate */
+  /** Use CertStorage's certificate if certStorage is initialized */
   get certificate() {
-    return this.ownCertificate;
+    if (!this.certStorage) {
+      throw new Error('certStorage is not initialized.');
+    }
+    return this.certStorage.certificate;
   }
 
-  /** Import an external certificate into the storage */
-  async importCert(cert: Certificate) {
-    await this.storage.set(cert.name.toString(), Encoder.encode(cert.data));
-  }
-
-  /**
-   * Fetch a certificate based on its name from local storage and then remote.
-   * @param keyName The certificate's name.
-   * @param localOnly If `true`, only look up the local storage without sending an Interest.
-   * @returns The fetched certificate. `undefined` if not found.
-   */
-  async getCertificate(keyName: Name, localOnly: boolean): Promise<Certificate | undefined> {
-    const certBytes = await this.storage.get(keyName.toString());
-    if (certBytes === undefined) {
-      if (localOnly) {
-        return undefined;
-      } else {
-        try {
-          const result = await endpoint.consume(
-            new Interest(
-              keyName,
-              Interest.MustBeFresh,
-              Interest.Lifetime(5000),
-            ),
-            {
-              // Fetched key must be signed by a known key
-              // TODO: Find a better way to handle security
-              verifier: this.localVerifier,
-              retx: 20,
-              fw: this.fw,
-            },
-          );
-
-          // Cache result certificates. NOTE: no await needed
-          this.storage.set(result.name.toString(), Encoder.encode(result));
-
-          return Certificate.fromData(result);
-        } catch {
-          //console.error(`Failed to fetch certificate: ${keyName.toString()}`);
-          return undefined;
-        }
-      }
-    } else {
-      return Certificate.fromData(Decoder.decode(certBytes, Data));
+  async getPublicKey(): Promise<Uint8Array | null> {
+    if (!this.personal_publicKey) {
+      console.warn('Public key is not set.');
+      return null;
     }
-  }
-
-  /**
-   * Verify a packet. Throw an error if failed.
-   * @param pkt The packet to verify.
-   * @param localOnly If `true`, only look up the local storage for the certificate.
-   */
-  async verify(pkt: Verifier.Verifiable, localOnly: boolean) {
-    const keyName = pkt.sigInfo?.keyLocator?.name;
-    if (!keyName) {
-      throw new Error(`Data not signed: ${pkt.name.toString()}`);
-    }
-    const cert = await this.getCertificate(keyName, localOnly);
-    if (cert === undefined) {
-      throw new Error(`No certificate: ${pkt.name.toString()} signed by ${keyName.toString()}`);
-    }
-    const verifier = await createVerifier(cert, { algoList: [ECDSA] });
     try {
-      await verifier.verify(pkt);
+      const publicKeyArrayBuffer = await crypto.subtle.exportKey('spki', this.personal_publicKey);
+      return new Uint8Array(publicKeyArrayBuffer);
     } catch (error) {
-      throw new Error(`Unable to verify ${pkt.name.toString()} signed by ${keyName.toString()} due to: ${error}`);
+      console.error('Failed to export public key:', error);
+      return null;
     }
   }
 
-  /** Obtain an verifier that fetches certificate */
-  get verifier(): Verifier {
-    return {
-      verify: (pkt) => this.verify(pkt, false),
-    };
+  async getPrivateKey(): Promise<Uint8Array | null> {
+    if (!this.personal_privateKey) {
+      console.warn('Private key is not set.');
+      return null;
+    }
+    try {
+      const privateKeyArrayBuffer = await crypto.subtle.exportKey('pkcs8', this.personal_privateKey);
+      return new Uint8Array(privateKeyArrayBuffer);
+    } catch (error) {
+      console.error('Failed to export private key:', error);
+      return null;
+    }
   }
 
-  /** Obtain an verifier that does not fetch certificate remotely */
-  get localVerifier(): Verifier {
-    return {
-      verify: (pkt) => this.verify(pkt, true),
-    };
+  pemToArrayBuffer(pem: string): ArrayBuffer {
+    // Remove headers, footers, and any whitespace characters like newlines or spaces
+    const b64 = pem.replace(/(-----(BEGIN|END) (CERTIFICATE|PRIVATE KEY|PUBLIC KEY)-----|\s|\r|\n)/g, '');
+
+    try {
+      // Decode the Base64 string to binary data
+      const binaryString = atob(b64);
+      const bytes = new Uint8Array(binaryString.length);
+
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      return bytes.buffer;
+    } catch (error) {
+      console.error('Failed to decode base64 string. Check that the input is correctly formatted.', error);
+      throw error;
+    }
   }
 
-  public static async create(
-    trustAnchor: Certificate,
-    ownCertificate: Certificate,
-    storage: Storage,
-    fw: Forwarder,
-    prvKeyBits: Uint8Array,
-  ) {
-    const result = new InvitationPackage(
-      trustAnchor,
-      ownCertificate,
-      storage,
-      fw,
-      prvKeyBits,
+  async setKeysFromStrings(privateKeyPem: string, publicKeyPem: string, email: string) {
+    try {
+      const privateKeyBytes = this.pemToArrayBuffer(privateKeyPem);
+      const publicKeyBytes = this.pemToArrayBuffer(publicKeyPem);
+
+      this.personal_privateKey = await crypto.subtle.importKey(
+        'pkcs8',
+        privateKeyBytes,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign'],
+      );
+
+      this.personal_publicKey = await crypto.subtle.importKey(
+        'spki',
+        publicKeyBytes,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['verify'],
+      );
+
+      // Set email as Name type
+      this.email = new Name(email);
+
+      // Create the signer
+      await this.createSigner();
+
+      console.log('Keys successfully set in InvitationPackage');
+      console.log('Private Key Info:', {
+        type: this.personal_privateKey.type,
+        algorithm: this.personal_privateKey.algorithm,
+        usages: this.personal_privateKey.usages,
+      });
+
+      console.log('Public Key Info:', {
+        type: this.personal_publicKey.type,
+        algorithm: this.personal_publicKey.algorithm,
+        usages: this.personal_publicKey.usages,
+      });
+    } catch (error) {
+      console.error('Failed to set keys:', error);
+    }
+  }
+
+  /** Create the signer using ECDSA.cryptoGenerate to import the keys */
+  private async createSigner() {
+    if (!this.personal_privateKey || !this.personal_publicKey || !this.email) {
+      throw new Error('Keys or email are not set. Cannot create signer.');
+    }
+
+    // Get the private and public key as Uint8Array
+    const privateKeyBytes = await this.getPrivateKey();
+    const publicKeyBytes = await this.getPublicKey();
+
+    if (!privateKeyBytes || !publicKeyBytes) {
+      throw new Error('Failed to retrieve keys as Uint8Array. Ensure keys are properly set.');
+    }
+
+    // Generate key pair using cryptoGenerate with imported keys
+    const keyPair = await ECDSA.cryptoGenerate({
+      importPkcs8: [privateKeyBytes, publicKeyBytes],
+    }, true);
+
+    // Construct the full name as email/KEY/randomNumber
+    const fullName = new Name([this.email.toString(), 'KEY', Math.floor(Math.random() * 100000).toString()]);
+
+    // Use this constructed Name in createSigner
+    this.signer = createSigner(fullName, ECDSA, keyPair);
+
+    console.log('Signer successfully created');
+  }
+
+  /** Generate a personal certificate using Certificate.build */
+  async generatePersonalCertificate(): Promise<Certificate> {
+    if (!this.signer || !this.personal_publicKey || !this.email) {
+      throw new Error('Signer, public key, or email is not set.');
+    }
+
+    // Construct the certificate name according to the new convention
+    const certName = new Name([
+      this.email.toString(), // IdentityName (email)
+      'KEY',
+      '1', // KeyId
+      this.email.toString(), // IssuerId (email)
+      Version.create(Date.now()), // Version (current timestamp for uniqueness)
+    ]);
+
+    console.log(certName);
+
+    // Convert the public key to SPKI format (Uint8Array)
+    const publicKeySpki = new Uint8Array(await crypto.subtle.exportKey('spki', this.personal_publicKey));
+
+    // Set the validity period (e.g., 1 year)
+    const validityPeriod = new ValidityPeriod(Date.now(), Date.now() + 365 * 24 * 60 * 60 * 1000);
+
+    // Use Certificate.build to create the certificate
+    const personalCert = await Certificate.build({
+      name: certName,
+      publicKeySpki,
+      signer: this.signer,
+      validity: validityPeriod,
+    });
+
+    console.log('Personal certificate generated:', personalCert);
+
+    return personalCert;
+  }
+
+  /** Create an invitation using the CertStorage signer */
+  createInvitation(inviteeCert: Certificate): InvitationData {
+    if (!this.certStorage) {
+      throw new Error('certStorage is not initialized.');
+    }
+
+    const invitationData = {
+      workspaceCert: this.certStorage.trustAnchor,
+      inviteeCert,
+    };
+
+    return invitationData;
+  }
+
+  ////////////////////
+
+  /** Generate a workspace certificate signed by the provided X.509 private key */
+  async generateWorkspaceCertificate(
+    domainName: string,
+    workspaceName: string,
+    x509PrivateKeyPem: string,
+    x509Certificate: string,
+  ): Promise<Certificate> {
+    if (!domainName || !workspaceName || !x509PrivateKeyPem || !x509Certificate) {
+      throw new Error('Domain name, workspace name, X.509 certificate, or private key is missing.');
+    }
+
+    // Concatenate domain name and workspace name
+    const identityName = `${domainName}.${workspaceName}`;
+
+    // Construct the certificate name according to the new convention
+    const certName = new Name([
+      identityName, // IdentityName (email)
+      'KEY',
+      '1', // KeyId
+      domainName, // IssuerId (email)
+      Version.create(Date.now()), // Version (current timestamp for uniqueness)
+    ]);
+
+    // Generate a new ECDSA key pair for the workspace
+    const { privateKey: _workspacePrivateKey, publicKey: workspacePublicKey } = await ECDSA.cryptoGenerate({}, true);
+
+    // Convert the X.509 PEM private key to CryptoKey format for signing
+    const x509PrivateKeyBytes = new Uint8Array(this.pemToArrayBuffer(x509PrivateKeyPem));
+
+    const x509SignerKeyPair = await ECDSA.cryptoGenerate(
+      {
+        importPkcs8: [
+          x509PrivateKeyBytes,
+          new Uint8Array(
+            this.pemToArrayBuffer(
+              '-----BEGIN PUBLIC KEY-----MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9nbBuq8RSXfjzvKGOwkWZNA55l700FHc2IS3JTLQhLrS2m7IB6ggjhyupEVu9nWA0VJqi1CBTO5R0sk3e1yDvA==-----END PUBLIC KEY-----',
+            ),
+          ),
+        ],
+      },
+      true,
     );
-    await result.readyEvent;
-    return result;
+
+    // Construct the full name as email/KEY/randomNumber
+    const signername = new Name([identityName, 'KEY', Math.floor(Math.random() * 100000).toString()]);
+
+    // Create the signer using the imported X.509 private key
+    const x509Signer = createSigner(signername, ECDSA, x509SignerKeyPair);
+
+    // Set up the validity period (e.g., 1 year from now)
+    const validityPeriod = new ValidityPeriod(Date.now(), Date.now() + 365 * 24 * 60 * 60 * 1000);
+
+    // Build and return the workspace certificate, signed by the X.509 private key
+    const workspaceCert = await Certificate.build({
+      name: certName,
+      publicKeySpki: new Uint8Array(await crypto.subtle.exportKey('spki', workspacePublicKey)),
+      signer: x509Signer,
+      validity: validityPeriod,
+    });
+
+    console.log('Workspace certificate generated:', workspaceCert);
+    return workspaceCert;
   }
-
-  // Function to create an invitation
-async createInvitation(
-  inviteeCert: Certificate,      // Invitee's certificate (K1 → K1')
-  trustPolicies: string          // Trust policies for the workspace
-): Promise<InvitationData> {
-  // Step 1: Create the invitation data object using `trustAnchor` as the workspace certificate
-  const invitationData = {
-    workspaceCert: this.trustAnchor,  // Using the trustAnchor as the workspace certificate
-    inviteeCert,                 // Invitee's certificate
-    trustPolicies,               // Trust policies as a string
-    signature: new Uint8Array(), // Signature placeholder to be filled later
-  };
-
-  // Step 2: Serialize the invitation data (excluding signature for now)
-  const serializedData = this.serializeInvitation(invitationData);
-
-  // Step 3: Create the Signable object
-  const name = new Name([
-    ...this.trustAnchor.name.comps,              // <workspace> components from trustAnchor
-    ...this.ownCertificate.name.comps,           // <inviter> components from ownCertificate
-    Component.from("INVITE"),                    // Convert "INVITE" to a Component
-    ...inviteeCert.name.getPrefix(-1).comps,     // Extract components from <invitee>
-    Component.from(Date.now().toString()),       // Convert timestamp to a Component
-  ]);
-
-  // Step 4: Create a Data packet with the constructed name and serialized invitation data
-  const dataPacket = new Data(name);
-  dataPacket.content = serializedData;  // Set the serialized invitation data as the content
-
-  // Step 5: Use the existing signer (this.signer) to sign the Data packet
-  await this.signer.sign(dataPacket);
-
-  // Step 6: After signing, the signature is stored within the Data packet
-  // Extract the signature from the Data packet if needed
-  const signature = dataPacket.sigValue;  // This contains the signature
-
-  // Step 7: Store the signature in the invitation data
-  invitationData.signature = signature;
-
-  // Step 8: Return the completed invitation data
-  return invitationData;
-}
-
-// Helper function to serialize invitation data (excluding signature)
-serializeInvitation(data: Omit<InvitationData, "signature">): Uint8Array {
-  // Convert the relevant fields of the invitation to a binary format for signing
-  const jsonData = {
-    workspaceCert: data.workspaceCert.data,  // Get the raw certificate data
-    inviteeCert: data.inviteeCert.data,      // Get the invitee's raw certificate data
-    trustPolicies: data.trustPolicies,       // Trust policies as a string
-  };
-
-  // Return a Uint8Array that represents the serialized invitation
-  return new TextEncoder().encode(JSON.stringify(jsonData));
-}
-
-// Define the function that takes a serialized invitation and deserializes it back into an InvitationData object
-deserializeInvitation(serializedInvitation: Uint8Array): InvitationData {
-  // Step 1: Convert the Uint8Array back into a string (assuming it's JSON-encoded)
-  const jsonString = new TextDecoder().decode(serializedInvitation);
-  
-  // Step 2: Parse the JSON string back into an object
-  const parsedData = JSON.parse(jsonString);
-  
-  // Step 3: Recreate the certificates from the parsed data
-  const workspaceCert = Certificate.fromData(parsedData.workspaceCert);
-  const inviteeCert = Certificate.fromData(parsedData.inviteeCert);
-  
-  // Step 4: Return the reconstructed InvitationData object
-  return {
-    workspaceCert: workspaceCert,            // Reconstructed workspace certificate
-    inviteeCert: inviteeCert,                // Reconstructed invitee certificate
-    trustPolicies: parsedData.trustPolicies, // Trust policies as a string
-    signature: parsedData.signature          // Signature as a Uint8Array
-  };
-}
-
 }

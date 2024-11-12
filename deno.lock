@@ -151,6 +151,7 @@
     "packageJson": {
       "dependencies": [
         "npm:@types/wicg-file-system-access@^2023.10.5",
+        "npm:@ucla-irl/ndnts-aux@^3.0.5",
         "npm:abortable-iterator@^5.1.0",
         "npm:cbor-x@^1.6.0",
         "npm:event-iterator@^2.0.0",
